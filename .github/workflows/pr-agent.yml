@@ -1,0 +1,117 @@
+# Shared PR-Agent reviewer (reusable workflow).
+#
+# Called from a tiny stub in each repo (see stub/.github/workflows/ai-review.yml).
+# Routing, all decided here so the stubs never need to change:
+#
+#   PRIVATE repo  -> PR-Agent is the primary reviewer: review + improve on open,
+#                    re-review on every push, and /commands from you.
+#   PUBLIC repo   -> CodeRabbit stays primary. PR-Agent runs only when CodeRabbit
+#                    posts its rate-limit notice, or when you run it manually.
+#
+# Model: MiniMax-M3 via your Token Plan key (repo secret MINIMAX_API_KEY).
+
+name: PR-Agent (shared)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number for a manual run (workflow_dispatch in the stub)"
+        type: string
+        required: false
+        default: ""
+    # MINIMAX_API_KEY arrives via `secrets: inherit` in the stub.
+
+env:
+  # One place to change the model for every repo.
+  PRA_MODEL: minimax/MiniMax-M3
+  PRA_MAX_TOKENS: "200000"
+  PR_AGENT_IMAGE: pragent/pr-agent:latest
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Private repos: PR-Agent as the primary reviewer.
+  #    Also handles "/review", "/improve", "/ask ..." etc. typed by you on any repo.
+  # ---------------------------------------------------------------------------
+  primary:
+    if: >-
+      (github.event_name == 'pull_request' && github.event.repository.private &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.user.login != 'dependabot[bot]')
+      ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.sender.type != 'Bot' &&
+       startsWith(github.event.comment.body, '/') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: pr-agent-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: PR-Agent
+        uses: the-pr-agent/pr-agent@v0.46.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          config.model: ${{ env.PRA_MODEL }}
+          config.fallback_models: '["${{ env.PRA_MODEL }}"]'
+          config.custom_model_max_tokens: ${{ env.PRA_MAX_TOKENS }}
+          # Your agents write the PR title/body, so don't let /describe overwrite them.
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_review: "true"
+          github_action_config.auto_improve: "true"
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
+          # Re-review after each push, like CodeRabbit's incremental reviews.
+          github_action_config.handle_push_trigger: "true"
+          github_action_config.push_commands: '["/review"]'
+
+  # ---------------------------------------------------------------------------
+  # 2) Public repos: fallback when CodeRabbit is rate-limited, or a manual run.
+  #    PR-Agent's own action ignores bot comments, so run its CLI image directly.
+  # ---------------------------------------------------------------------------
+  coderabbit-fallback:
+    if: >-
+      inputs.pr_number != ''
+      ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.comment.user.login == 'coderabbitai[bot]' &&
+       (contains(github.event.comment.body, 'rate limited by coderabbit.ai') ||
+        contains(github.event.comment.body, 'Review limit reached') ||
+        contains(github.event.comment.body, 'Rate limit exceeded')) &&
+       !(github.event.action == 'edited' &&
+         (contains(github.event.changes.body.from, 'rate limited by coderabbit.ai') ||
+          contains(github.event.changes.body.from, 'Review limit reached') ||
+          contains(github.event.changes.body.from, 'Rate limit exceeded'))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: pr-agent-fallback-${{ github.repository }}-${{ inputs.pr_number || github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Run PR-Agent review + improve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ inputs.pr_number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          echo "Fallback review for $PR_URL"
+          for cmd in review improve; do
+            docker run --rm \
+              -e GITHUB__USER_TOKEN="$GITHUB_TOKEN" \
+              -e MINIMAX_API_KEY \
+              -e CONFIG__MODEL="$PRA_MODEL" \
+              -e CONFIG__FALLBACK_MODELS="[\"$PRA_MODEL\"]" \
+              -e CONFIG__CUSTOM_MODEL_MAX_TOKENS="$PRA_MAX_TOKENS" \
+              -e PR_REVIEWER__EXTRA_INSTRUCTIONS="Note: CodeRabbit was rate-limited on this PR; this is the backup review." \
+              "$PR_AGENT_IMAGE" --pr_url "$PR_URL" "$cmd"
+          done
