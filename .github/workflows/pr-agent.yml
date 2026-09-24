@@ -20,7 +20,10 @@ on:
         type: string
         required: false
         default: ""
-    # MINIMAX_API_KEY arrives via `secrets: inherit` in the stub.
+    secrets:
+      # Passed explicitly by the stub, so no other repo secrets reach this workflow.
+      MINIMAX_API_KEY:
+        required: false
 
 env:
   # One place to change the model for every repo.
