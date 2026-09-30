@@ -80,8 +80,13 @@ jobs:
           github_action_config.push_commands: '["/review"]'
 
   # ---------------------------------------------------------------------------
-  # 2) Public repos: fallback when CodeRabbit is rate-limited, or a manual run.
-  #    PR-Agent's own action ignores bot comments, so run its CLI image directly.
+  # 2) Public repos: fallback when CodeRabbit is rate-limited or its review
+  #    fails, or a manual run. PR-Agent's own action ignores bot comments, so
+  #    run its CLI image directly.
+  #    Trigger: a CodeRabbit comment, created or edited, containing any notice
+  #    phrase. Edits count: CodeRabbit re-renders one summary comment, so a new
+  #    notice often arrives as an edit of a comment that already had an old one.
+  #    Dedupe is by head commit instead (the "Once per head commit" step).
   # ---------------------------------------------------------------------------
   coderabbit-fallback:
     if: >-
@@ -91,14 +96,13 @@ jobs:
        github.event.comment.user.login == 'coderabbitai[bot]' &&
        (contains(github.event.comment.body, 'rate limited by coderabbit.ai') ||
         contains(github.event.comment.body, 'Review limit reached') ||
-        contains(github.event.comment.body, 'Rate limit exceeded')) &&
-       !(github.event.action == 'edited' &&
-         (contains(github.event.changes.body.from, 'rate limited by coderabbit.ai') ||
-          contains(github.event.changes.body.from, 'Review limit reached') ||
-          contains(github.event.changes.body.from, 'Rate limit exceeded'))))
+        contains(github.event.comment.body, 'Rate limit exceeded') ||
+        contains(github.event.comment.body, 'Review rate limited') ||
+        contains(github.event.comment.body, 'Review failed')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
+      # Queued, never cancelled, so the guard below sees the previous run's marker.
       group: pr-agent-fallback-${{ github.repository }}-${{ inputs.pr_number || github.event.issue.number }}
       cancel-in-progress: false
     permissions:
@@ -106,7 +110,42 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      # Run at most once per PR head commit. A manual run always proceeds (it is
+      # an explicit request) but still records its marker. A notice-triggered
+      # run skips when this head already has a fallback marker, or when
+      # CodeRabbit has since submitted a review on this head.
+      - name: Once per head commit
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.issue.number }}
+          MANUAL: ${{ inputs.pr_number != '' }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR number must be digits"; exit 1
+          fi
+          head="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          marker="<!-- review-workflows:pr-agent-fallback head=$head -->"
+          if [[ "$MANUAL" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          done_before="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s --arg m "$marker" '[.[][] | select(.user.login == "github-actions[bot]" and (.body | contains($m)))] | length')"
+          cr_reviewed="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            | jq -s --arg h "$head" '[.[][] | select(.user.login == "coderabbitai[bot]" and .commit_id == $h)] | length')"
+          if (( done_before > 0 )); then
+            echo "Fallback already ran for head $head; skipping."; echo "run=false" >> "$GITHUB_OUTPUT"
+          elif (( cr_reviewed > 0 )); then
+            echo "CodeRabbit already reviewed head $head; skipping."; echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run PR-Agent review + improve
+        if: steps.guard.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
@@ -124,3 +163,15 @@ jobs:
               -e PR_REVIEWER__EXTRA_INSTRUCTIONS="Note: CodeRabbit was rate-limited on this PR; this is the backup review." \
               "$PR_AGENT_IMAGE" --pr_url "$PR_URL" "$cmd"
           done
+
+      - name: Record fallback marker for this head
+        if: steps.guard.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.issue.number }}
+          HEAD_SHA: ${{ steps.guard.outputs.head }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "<!-- review-workflows:pr-agent-fallback head=$HEAD_SHA -->
+          PR-Agent backup review ran for \`${HEAD_SHA:0:7}\`. Later CodeRabbit notices for this commit will not re-run it."
